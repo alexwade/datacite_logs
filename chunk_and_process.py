@@ -25,10 +25,10 @@ SOURCE_BUCKET    = os.environ.get("DEST_BUCKET", "datacite-logs")
 PROCESSED_BUCKET = os.environ.get("PROCESSED_BUCKET", "datacite-logs-processed")
 
 ALL_KEYS = [
-    "202604/DataCite-access.log-202604-ap-southeast-1.gz",
-    "202604/DataCite-access.log-202604-eu-west-1.gz",
-    "202604/DataCite-access.log-202604-us-east-1.gz",
-    "202604/DataCite-access.log-202604-us-west-2.gz",
+    "202605/DataCite-access.log-202605-ap-southeast-1.gz",
+    "202605/DataCite-access.log-202605-eu-west-1.gz",
+    "202605/DataCite-access.log-202605-us-east-1.gz",
+    "202605/DataCite-access.log-202605-us-west-2.gz",
 ]
 
 CLUSTER      = os.environ.get("ECS_CLUSTER", "datacite-logs")
@@ -58,7 +58,7 @@ class _MultipartGzipWriter:
             self._flush()
 
     def _flush(self) -> None:
-        self._gz.flush()
+        self._gz.close()  # finalize the gzip member (writes CRC32 + footer)
         size = self._gz_buf.tell()
         if size == 0:
             return
@@ -74,8 +74,17 @@ class _MultipartGzipWriter:
         self._parts.append({"PartNumber": part_num, "ETag": resp["ETag"]})
 
     def complete(self) -> None:
-        self._gz.close()
-        self._flush()
+        self._gz.close()  # finalizes gzip stream, writes footer into self._gz_buf
+        size = self._gz_buf.tell()
+        if size > 0:
+            self._gz_buf.seek(0)
+            data = self._gz_buf.read(size)
+            part_num = len(self._parts) + 1
+            resp = self._s3.upload_part(
+                Bucket=self._bucket, Key=self._key,
+                UploadId=self._upload_id, PartNumber=part_num, Body=data,
+            )
+            self._parts.append({"PartNumber": part_num, "ETag": resp["ETag"]})
         if not self._parts:
             self._s3.abort_multipart_upload(
                 Bucket=self._bucket, Key=self._key, UploadId=self._upload_id
@@ -122,7 +131,7 @@ def launch_tasks(s3, ecs, chunk_keys: list[str]) -> list[str]:
         original_stem = chunk_key.split("/chunks/")[1].split("-chunk-")[0]
         parts = original_stem.split("-")
         region_str = "-".join(parts[3:]).replace("-chunk", "")
-        output_key = f"datacite-logs/year=2026/month=4/region={region_str}/{stem}.parquet"
+        output_key = f"datacite-logs/year=2026/month=5/region={region_str}/{stem}.parquet"
 
         resp = ecs.run_task(
             cluster=CLUSTER,
