@@ -11,8 +11,9 @@ raw-resolution-logs.datacite.org  (source account)
         ▼
 s3://datacite-logs/YYYYMM/        ← raw .gz files, one per region
         │
-        │  AWS ECS Fargate task    ← triggered by S3 Event → EventBridge
-        │  log_processor.py        ← streams gzip line-by-line → Parquet
+        │  chunk_and_process.py    ← splits each .gz into 8 chunks,
+        │                             launches 32 Fargate tasks in parallel
+        │                             (4 regions × 8 chunks × 2 vCPU = 64 vCPU)
         ▼
 s3://datacite-logs-processed/datacite-logs/year=YYYY/month=M/region=<region>/
         │                          ← Hive-partitioned Parquet, Snappy compressed
@@ -42,11 +43,14 @@ AWS Athena  datacite.resolution_logs
 | Source bucket | `raw-resolution-logs.datacite.org` |
 | Staging bucket | `datacite-logs` (us-east-2) |
 | Output bucket | `datacite-logs-processed` (us-east-2) |
+| Comparison bucket | `datacite-logs-processed-compare` (us-east-2) |
 | ECS Cluster | `datacite-logs` |
 | Task definition | `datacite-log-processor` (current: `:4`) |
 | Container name | `log-processor` |
+| Fargate vCPU quota | 64 vCPU on-demand (us-east-2) |
 | Athena database | `datacite` |
 | Athena table | `resolution_logs` |
+| Athena comparison table | `resolution_logs_compare` |
 | Region | `us-east-2` |
 
 ---
@@ -124,15 +128,21 @@ These are Handle System protocol codes, not HTTP status codes:
 python copy_logs.py
 ```
 
-### 2. Trigger Fargate processing
+### 2. Chunk and process in parallel
 
-An S3 Event Notification on `datacite-logs` fires an EventBridge rule that launches one Fargate task per uploaded `.gz` file. The task:
+```bash
+python chunk_and_process.py
+# single file:
+python chunk_and_process.py --key 202605/DataCite-access.log-202605-us-east-1.gz
+```
 
-- Streams gzip decompression line-by-line (peak memory ~50–100 MB regardless of file size)
-- Writes a single valid Parquet file to the processed bucket via `_S3StreamingBuffer`
-- Runs to completion with no timeout — large files (~1.8 GB compressed, 385M rows) take ~50 minutes
+All four regional files are processed concurrently. For each file:
 
-No Lambda, no queue. One task, one file, one Parquet output.
+- The `.gz` is streamed from S3 and round-robin split into 8 gzip chunk files
+- 8 Fargate tasks are launched in parallel, one per chunk
+- All 32 tasks (4 regions × 8) fire simultaneously and run independently
+
+Each task streams gzip decompression line-by-line (peak memory ~50–100 MB) and writes one Parquet file to S3 via `_S3StreamingBuffer`. The largest file (~1.8 GB compressed, 385M rows) previously took ~50 min single-threaded; with 8 parallel chunks it completes in ~6 min.
 
 ### 3. Register new Athena partitions
 
@@ -146,6 +156,47 @@ ALTER TABLE datacite.resolution_logs ADD PARTITION
 **Partition format notes:**
 - Use `month=5` not `month=05` — Athena's INT partition type does not match leading-zero strings
 - Use full region names: `us-east-1`, `eu-west-1`, `us-west-2`, `ap-southeast-1`
+
+---
+
+## Comparison Runs
+
+To validate a pipeline change without overwriting production data, direct output to the comparison bucket:
+
+```bash
+python chunk_and_process.py --output-bucket datacite-logs-processed-compare
+```
+
+Create the comparison Athena table once:
+
+```sql
+CREATE EXTERNAL TABLE datacite.resolution_logs_compare (
+  client_ip        string,
+  protocol         string,
+  ts               timestamp,
+  request_count    int,
+  response_code    smallint,
+  duration_ms      int,
+  doi              string,
+  referrer_handle  string,
+  referrer_url     string,
+  user_agent       string
+)
+PARTITIONED BY (year int, month int, region string)
+STORED AS PARQUET
+LOCATION 's3://datacite-logs-processed-compare/datacite-logs'
+TBLPROPERTIES ('parquet.compress'='SNAPPY');
+```
+
+Register partitions after each comparison run (same `ALTER TABLE ADD PARTITION` pattern as the main table, pointing to the compare bucket). Then diff against production:
+
+```sql
+SELECT
+  'production'  AS run, COUNT(*) AS rows FROM datacite.resolution_logs    WHERE year=2026 AND month=5
+UNION ALL
+SELECT
+  'compare'     AS run, COUNT(*) AS rows FROM datacite.resolution_logs_compare WHERE year=2026 AND month=5;
+```
 
 ---
 
@@ -166,39 +217,6 @@ Filename pattern: `DataCite-access.log-YYYYMM-<region>.gz`. Split on `-`, join f
 ---
 
 ## Future Work
-
-### Chunked parallel processing
-
-For large files (us-east-1 at 385M rows takes ~50 min), splitting each `.gz` into N chunks and processing them in parallel across N Fargate tasks reduces wall-clock time proportionally.
-
-`chunk_and_process.py` implements this today and can be run manually:
-
-```bash
-python chunk_and_process.py --chunks 8
-# single file:
-python chunk_and_process.py --chunks 8 --key 202605/DataCite-access.log-202605-us-east-1.gz
-```
-
-**How it works:**
-
-```
-s3://datacite-logs/YYYYMM/<file>.gz
-        │
-        │  chunk_and_process.py
-        │  streams .gz, round-robins lines into N gzip chunk files
-        │  uploads chunks → s3://datacite-logs/YYYYMM/chunks/
-        │  launches N Fargate tasks in parallel
-        │
-        ├── Fargate task 0  →  <file>-chunk-000.parquet
-        ├── Fargate task 1  →  <file>-chunk-001.parquet
-        └── Fargate task N  →  <file>-chunk-00N.parquet
-                │
-                │  all land in the same Hive partition directory
-                ▼
-s3://datacite-logs-processed/datacite-logs/year=YYYY/month=M/region=<region>/
-```
-
-**Blocker:** The default Fargate vCPU quota in us-east-2 is 2 vCPU (1 task at 2 vCPU). A quota increase to 32 vCPU has been requested, which would allow 8–16 parallel tasks per file. Once approved, target configuration is 8 chunks per file (~6 min end-to-end for the largest files).
 
 ### Automated partition registration
 
