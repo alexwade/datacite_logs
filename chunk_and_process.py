@@ -16,6 +16,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from botocore.config import Config
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -162,7 +163,8 @@ def launch_tasks(s3, ecs, chunk_keys: list[str], output_bucket: str) -> list[str
 
 def process_key(key: str, n_chunks: int, output_bucket: str) -> tuple[str, list[str]]:
     """Chunk a single key and launch its Fargate tasks. Runs in a thread."""
-    s3  = boto3.client("s3",  aws_access_key_id=SOURCE_KEY_ID, aws_secret_access_key=SOURCE_SECRET, region_name=REGION)
+    s3  = boto3.client("s3",  aws_access_key_id=SOURCE_KEY_ID, aws_secret_access_key=SOURCE_SECRET, region_name=REGION,
+                       config=Config(read_timeout=300, retries={"max_attempts": 3}))
     ecs = boto3.client("ecs", aws_access_key_id=SOURCE_KEY_ID, aws_secret_access_key=SOURCE_SECRET, region_name=REGION)
     print(f"\n{'='*60}\nProcessing: {key}")
     chunk_keys = chunk_file(s3, key, n_chunks)
