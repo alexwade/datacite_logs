@@ -15,6 +15,7 @@ import io
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -121,13 +122,11 @@ def chunk_file(s3, key: str, n: int) -> list[str]:
     return chunk_keys
 
 
-def launch_tasks(s3, ecs, chunk_keys: list[str]) -> list[str]:
+def launch_tasks(s3, ecs, chunk_keys: list[str], output_bucket: str) -> list[str]:
     """Launch one Fargate task per chunk. Returns list of task ARNs."""
     task_arns = []
     for i, chunk_key in enumerate(chunk_keys):
-        # Output key: same partition, different filename per chunk
         stem = chunk_key.split("/")[-1].replace(".gz", "")
-        # Extract region from original filename pattern
         original_stem = chunk_key.split("/chunks/")[1].split("-chunk-")[0]
         parts = original_stem.split("-")
         region_str = "-".join(parts[3:]).replace("-chunk", "")
@@ -147,6 +146,7 @@ def launch_tasks(s3, ecs, chunk_keys: list[str]) -> list[str]:
                     {"name": "INPUT_BUCKET",  "value": SOURCE_BUCKET},
                     {"name": "INPUT_KEY",     "value": chunk_key},
                     {"name": "OUTPUT_KEY",    "value": output_key},
+                    {"name": "OUTPUT_BUCKET", "value": output_bucket},
                 ],
             }]},
         )
@@ -158,6 +158,17 @@ def launch_tasks(s3, ecs, chunk_keys: list[str]) -> list[str]:
             print(f"  Launched chunk {i}: {arn.split('/')[-1]}")
 
     return task_arns
+
+
+def process_key(key: str, n_chunks: int, output_bucket: str) -> tuple[str, list[str]]:
+    """Chunk a single key and launch its Fargate tasks. Runs in a thread."""
+    s3  = boto3.client("s3",  aws_access_key_id=SOURCE_KEY_ID, aws_secret_access_key=SOURCE_SECRET, region_name=REGION)
+    ecs = boto3.client("ecs", aws_access_key_id=SOURCE_KEY_ID, aws_secret_access_key=SOURCE_SECRET, region_name=REGION)
+    print(f"\n{'='*60}\nProcessing: {key}")
+    chunk_keys = chunk_file(s3, key, n_chunks)
+    task_arns = launch_tasks(s3, ecs, chunk_keys, output_bucket)
+    print(f"  Launched {len(task_arns)} tasks for {key}")
+    return key, task_arns
 
 
 def wait_for_tasks(ecs, task_arns: list[str]) -> bool:
@@ -180,24 +191,24 @@ def wait_for_tasks(ecs, task_arns: list[str]) -> bool:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--chunks", type=int, default=4, help="Number of chunks per file")
+    parser.add_argument("--chunks", type=int, default=8, help="Number of chunks per file (default: 8, uses 64 vCPU across 4 regions)")
     parser.add_argument("--key", help="Process a single key instead of all files")
+    parser.add_argument("--output-bucket", dest="output_bucket", default=PROCESSED_BUCKET,
+                        help="S3 bucket for Parquet output (default: PROCESSED_BUCKET)")
     args = parser.parse_args()
 
-    s3  = boto3.client("s3",  aws_access_key_id=SOURCE_KEY_ID, aws_secret_access_key=SOURCE_SECRET, region_name=REGION)
-    ecs = boto3.client("ecs", aws_access_key_id=SOURCE_KEY_ID, aws_secret_access_key=SOURCE_SECRET, region_name=REGION)
-
     keys = [args.key] if args.key else ALL_KEYS
+    all_task_arns: list[str] = []
 
-    for key in keys:
-        print(f"\n{'='*60}")
-        print(f"Processing: {key}")
-        chunk_keys = chunk_file(s3, key, args.chunks)
-        task_arns = launch_tasks(s3, ecs, chunk_keys)
-        print(f"  Launched {len(task_arns)} tasks, waiting for completion...")
-        wait_for_tasks(ecs, task_arns)
-        print(f"  Done: {key}")
+    with ThreadPoolExecutor(max_workers=len(keys)) as pool:
+        futures = {pool.submit(process_key, key, args.chunks, args.output_bucket): key for key in keys}
+        for future in as_completed(futures):
+            key, task_arns = future.result()
+            all_task_arns.extend(task_arns)
 
+    ecs = boto3.client("ecs", aws_access_key_id=SOURCE_KEY_ID, aws_secret_access_key=SOURCE_SECRET, region_name=REGION)
+    print(f"\nWaiting for {len(all_task_arns)} total tasks...")
+    wait_for_tasks(ecs, all_task_arns)
     print("\nAll files processed.")
 
 
