@@ -122,43 +122,65 @@ def chunk_file(key: str, n: int) -> list[str]:
     return chunk_keys
 
 
+def _run_task(chunk_key: str, i: int, year: int, month: int) -> str | None:
+    """Attempt to launch one processor task. Returns ARN or None on vCPU limit."""
+    stem = chunk_key.split("/")[-1].replace(".gz", "")
+    original_stem = chunk_key.split("/chunks/")[1].split("-chunk-")[0]
+    region_str = "-".join(original_stem.split("-")[3:])
+    output_key = f"datacite-logs/year={year}/month={month}/region={region_str}/{stem}.parquet"
+
+    resp = ecs.run_task(
+        cluster=CLUSTER,
+        taskDefinition=TASK_DEF,
+        launchType="FARGATE",
+        networkConfiguration={"awsvpcConfiguration": {
+            "subnets": [SUBNET],
+            "assignPublicIp": "ENABLED",
+        }},
+        overrides={"containerOverrides": [{
+            "name": "log-processor",
+            "environment": [
+                {"name": "INPUT_BUCKET",  "value": INPUT_BUCKET},
+                {"name": "INPUT_KEY",     "value": chunk_key},
+                {"name": "OUTPUT_KEY",    "value": output_key},
+                {"name": "OUTPUT_BUCKET", "value": OUTPUT_BUCKET},
+            ],
+        }]},
+    )
+    if resp["failures"]:
+        reason = resp["failures"][0].get("reason", "")
+        if "limit" in reason.lower():
+            return None  # signal caller to retry
+        print(f"WARN chunk {i} failed permanently: {resp['failures']}", flush=True)
+        return "failed"
+    arn = resp["tasks"][0]["taskArn"]
+    print(f"Launched chunk {i}: {arn.split('/')[-1]}", flush=True)
+    return arn
+
+
 def launch_tasks(chunk_keys: list[str]) -> list[str]:
-    """Launch one processor Fargate task per chunk. Returns list of task ARNs."""
+    """Launch one processor Fargate task per chunk, retrying on vCPU limit. Returns list of task ARNs."""
     yyyymm = INPUT_KEY.split("/")[0]
     year, month = int(yyyymm[:4]), int(yyyymm[4:])
 
     task_arns = []
-    for i, chunk_key in enumerate(chunk_keys):
-        stem = chunk_key.split("/")[-1].replace(".gz", "")
-        original_stem = chunk_key.split("/chunks/")[1].split("-chunk-")[0]
-        parts = original_stem.split("-")
-        region_str = "-".join(parts[3:])
-        output_key = f"datacite-logs/year={year}/month={month}/region={region_str}/{stem}.parquet"
+    pending = list(enumerate(chunk_keys))
 
-        resp = ecs.run_task(
-            cluster=CLUSTER,
-            taskDefinition=TASK_DEF,
-            launchType="FARGATE",
-            networkConfiguration={"awsvpcConfiguration": {
-                "subnets": [SUBNET],
-                "assignPublicIp": "ENABLED",
-            }},
-            overrides={"containerOverrides": [{
-                "name": "log-processor",
-                "environment": [
-                    {"name": "INPUT_BUCKET",  "value": INPUT_BUCKET},
-                    {"name": "INPUT_KEY",     "value": chunk_key},
-                    {"name": "OUTPUT_KEY",    "value": output_key},
-                    {"name": "OUTPUT_BUCKET", "value": OUTPUT_BUCKET},
-                ],
-            }]},
-        )
-        if resp["failures"]:
-            print(f"WARN chunk {i} failed to launch: {resp['failures']}", flush=True)
+    while pending:
+        still_pending = []
+        for i, chunk_key in pending:
+            result = _run_task(chunk_key, i, year, month)
+            if result is None:
+                still_pending.append((i, chunk_key))
+            elif result != "failed":
+                task_arns.append(result)
+
+        if still_pending:
+            print(f"  {len(still_pending)} chunk(s) hit vCPU limit, retrying in 60s...", flush=True)
+            time.sleep(60)
+            pending = still_pending
         else:
-            arn = resp["tasks"][0]["taskArn"]
-            task_arns.append(arn)
-            print(f"Launched chunk {i}: {arn.split('/')[-1]}", flush=True)
+            break
 
     return task_arns
 
