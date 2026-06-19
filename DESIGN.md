@@ -124,6 +124,11 @@ These are Handle System protocol codes, not HTTP status codes:
 | 2026-04 | us-west-2 | 82,636,023 |
 | 2026-04 | ap-southeast-1 | 75,446,867 |
 | | **Total** | **634,600,821** |
+| 2026-05 | us-east-1 | 134,184,481 |
+| 2026-05 | eu-west-1 | 86,736,063 |
+| 2026-05 | us-west-2 | 81,471,598 |
+| 2026-05 | ap-southeast-1 | 142,841,771 |
+| | **Total** | **445,233,913** |
 
 ---
 
