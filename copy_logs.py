@@ -10,7 +10,7 @@ load_dotenv()
 SOURCE_KEY_ID     = os.environ["SOURCE_AWS_ACCESS_KEY_ID"]
 SOURCE_SECRET     = os.environ["SOURCE_AWS_SECRET_ACCESS_KEY"]
 SOURCE_BUCKET     = os.environ.get("SOURCE_BUCKET", "raw-resolution-logs.datacite.org")
-SOURCE_PREFIX     = os.environ.get("SOURCE_PREFIX", "202604/")
+SOURCE_PREFIX     = os.environ.get("SOURCE_PREFIX", "202605/")
 
 DEST_KEY_ID       = os.environ["DEST_AWS_ACCESS_KEY_ID"]
 DEST_SECRET       = os.environ["DEST_AWS_SECRET_ACCESS_KEY"]
@@ -99,6 +99,14 @@ def main():
 
     print(f"Found {len(keys)} files to copy\n", flush=True)
     for key in keys:
+        try:
+            dst_head = dst_s3.head_object(Bucket=DEST_BUCKET, Key=key)
+            src_head = src_s3.head_object(Bucket=SOURCE_BUCKET, Key=key)
+            if dst_head["ContentLength"] == src_head["ContentLength"]:
+                print(f"Skipping {key} (already copied)", flush=True)
+                continue
+        except ClientError:
+            pass
         copy_file(src_s3, dst_s3, key)
 
     print("\nAll done.")

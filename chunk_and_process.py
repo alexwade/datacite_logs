@@ -22,12 +22,11 @@ SOURCE_SECRET    = os.environ["DEST_AWS_SECRET_ACCESS_KEY"]
 SOURCE_BUCKET    = os.environ.get("DEST_BUCKET", "datacite-logs")
 PROCESSED_BUCKET = os.environ.get("PROCESSED_BUCKET", "datacite-logs-processed")
 
-ALL_KEYS = [
-    "202605/DataCite-access.log-202605-ap-southeast-1.gz",
-    "202605/DataCite-access.log-202605-eu-west-1.gz",
-    "202605/DataCite-access.log-202605-us-east-1.gz",
-    "202605/DataCite-access.log-202605-us-west-2.gz",
-]
+# Derive the month's keys from SOURCE_PREFIX (e.g. "202607/") so this no longer
+# has to be hand-edited each month. Override a single file with --key.
+_MONTH = os.environ.get("SOURCE_PREFIX", "202607/").strip("/")
+_REGIONS = ["ap-southeast-1", "eu-west-1", "us-east-1", "us-west-2"]
+ALL_KEYS = [f"{_MONTH}/DataCite-access.log-{_MONTH}-{r}.gz" for r in _REGIONS]
 
 CLUSTER       = os.environ.get("ECS_CLUSTER", "datacite-logs")
 TASK_DEF      = os.environ.get("ECS_TASK_DEF", "datacite-log-processor")
