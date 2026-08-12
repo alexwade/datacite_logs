@@ -82,10 +82,6 @@ WHERE year=2026 AND month=7 AND response_code = 1;
 | Jun 2026 | 320.7M | — |
 | Jul 2026 | 290.0M | 2.49% |
 
-## Handoff / ownership
+## Notes
 
-This repo is the canonical home for the resolution-logs pipeline. The related
-[`datacite-mcp`](https://github.com/alexwade/datacite-mcp) repo is a **separate**
-project (an MCP server over the DataCite REST API) and is not needed to operate
-this pipeline. Credentials live only in your local `.env` (gitignored); ask the
-current owner for the SOURCE and DEST AWS keys.
+AWS credentials live only in your local `.env` (gitignored) 
