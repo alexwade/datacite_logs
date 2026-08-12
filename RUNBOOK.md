@@ -10,10 +10,9 @@ for the architecture; this document is the "what do I actually run each month."
 > processing.** An S3 event fires a Lambda/Fargate job that turns each copied
 > `.gz` into exactly one Parquet file, in the right partition, on its own.
 >
-> So the normal monthly flow is just **copy → wait → register in Athena**.
-> **Do _not_ run `chunk_and_process.py`** for a normal month — that launches a
-> second, redundant processing path and pollutes the partitions with duplicate
-> "chunk" parquets. (If that happens, see [Recovery](#recovery-chunk-pollution).)
+> So the normal monthly flow is just **copy → wait → register in Athena**. You
+> should not need to launch any processing by hand; if a month's auto-trigger
+> fails, see [Manual reprocess](#manual-reprocess-rare).
 
 ---
 
@@ -79,8 +78,8 @@ AWS_SECRET_ACCESS_KEY="$DEST_AWS_SECRET_ACCESS_KEY" \
 #   .../region=us-west-2/DataCite-access-202607-us-west-2.parquet
 ```
 
-If you see extra files with `chunk` in the name, or `region=<region>-chunk-NNN/`
-partitions → someone ran `chunk_and_process.py`; go to [Recovery](#recovery-chunk-pollution).
+If a region's parquet is **missing** (its auto-trigger failed), see
+[Manual reprocess](#manual-reprocess-rare).
 
 ## 4. Register the new partitions in Athena and verify
 
@@ -111,33 +110,37 @@ traffic study (referrer + user-agent signals, all months) is in
 
 ---
 
-## Recovery: chunk pollution
+## Manual reprocess (rare)
 
-If `chunk_and_process.py` was run on an already-auto-processed month, the
-processed partitions contain the 4 correct parquets **plus** dozens of duplicate
-`...chunk-NNN.parquet` files and malformed `region=<region>-chunk-NNN/`
-partitions. Fix it **before** `MSCK REPAIR` (or re-run repair after):
+You only need this if a region's **auto-trigger failed** (a `.gz` is in the
+staging bucket but its Parquet never appeared). Pick one:
+
+**Option A — re-fire the S3 event by re-copying (simplest).** The event fires on
+object creation, and `copy_logs.py` skips files already present, so delete the
+staging object first, then re-copy:
 
 ```bash
 set -a; . ./.env; set +a
-# dry run — shows what would be deleted; keeps only the 4 clean whole-file parquets
-python scripts/cleanup_chunk_pollution.py --year 2026 --month 7
-# then actually delete
-python scripts/cleanup_chunk_pollution.py --year 2026 --month 7 --execute
+KEY="202607/DataCite-access.log-202607-us-east-1.gz"     # the failed region
+AWS_ACCESS_KEY_ID="$DEST_AWS_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$DEST_AWS_SECRET_ACCESS_KEY" \
+  aws s3 rm "s3://$DEST_BUCKET/$KEY" --region "$AWS_REGION"
+python copy_logs.py        # re-copies the missing file, re-triggering processing
 ```
 
-The script refuses to run unless the KEEP set is exactly the 4 expected
-whole-file parquets, so it can't delete good data.
+**Option B — run one processor task directly** on the whole file (no re-copy),
+using the same container the auto-trigger uses (`ECS_TASK_DEF`):
 
----
+```bash
+aws ecs run-task --cluster "$ECS_CLUSTER" --task-definition "$ECS_TASK_DEF" \
+  --launch-type FARGATE --region "$AWS_REGION" \
+  --network-configuration "awsvpcConfiguration={subnets=[$ECS_SUBNET],assignPublicIp=ENABLED}" \
+  --overrides '{"containerOverrides":[{"name":"log-processor","environment":[
+      {"name":"INPUT_BUCKET","value":"'"$DEST_BUCKET"'"},
+      {"name":"INPUT_KEY","value":"'"$KEY"'"}]}]}'
+```
 
-## When to use `chunk_and_process.py` (rare)
-
-Only for a **from-scratch reprocess** — e.g. a month whose auto-trigger failed,
-or a backfill of very old logs where no auto-processing ran. It launches Fargate
-splitter → processor tasks (needs the `ECS_*` vars in `.env`). It derives the
-month's file keys from `SOURCE_PREFIX`, so set that first; override a single file
-with `--key`. **Never run it for a month the auto-trigger already handled.**
+Both produce the single correct `region=<region>/…-<region>.parquet`. Then run
+`MSCK REPAIR TABLE` (step 4).
 
 ## Key AWS resources
 
@@ -147,7 +150,7 @@ with `--key`. **Never run it for a month the auto-trigger already handled.**
 | Staging bucket | `datacite-logs` (us-east-2) — **copy here to trigger processing** |
 | Processed bucket | `datacite-logs-processed` (us-east-2) — Parquet output |
 | Athena DB / table | `datacite.resolution_logs` |
-| ECS cluster / defs | `datacite-logs` / `datacite-log-processor`, `datacite-log-splitter` |
+| ECS cluster / task def | `datacite-logs` / `datacite-log-processor` |
 
 ## Troubleshooting
 
@@ -156,5 +159,5 @@ with `--key`. **Never run it for a month the auto-trigger already handled.**
 | Copy log shows `Connection reset` / `Read timeout`, then continues | Normal — the flaky cross-account link; `copy_logs.py` retries and recovers. |
 | Copy "stuck" at a % for 1–2 min | A read-timeout retry window (120s). It resumes; check the log tail for a new `part N` line. |
 | Athena `WHERE year=Y AND month=M` returns empty after copy | You didn't run `MSCK REPAIR TABLE` yet (this table uses manual partition registration, not projection). |
-| Duplicate / `region=...-chunk-NNN/` partitions | `chunk_and_process.py` was run redundantly → [Recovery](#recovery-chunk-pollution). |
+| A region's parquet never appeared after copy | That region's auto-trigger failed → [Manual reprocess](#manual-reprocess-rare). |
 | `copy_logs.py` KeyError on `*_AWS_ACCESS_KEY_ID` | `.env` missing/incomplete; ensure both SOURCE_ and DEST_ credential sets are set. |

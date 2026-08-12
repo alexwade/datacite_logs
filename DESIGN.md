@@ -11,20 +11,21 @@ Local machine
         ▼
 s3://datacite-logs/YYYYMM/     ← raw .gz files, one per region
         │
-        │  chunk_and_process.py — launches 4 splitter Fargate tasks (one per region)
+        │  S3 ObjectCreated event  →  auto-triggers one processor per file
         ▼
-Fargate splitter tasks ×4      ← run inside AWS, same region as S3
-        │  splitter.py         — streams .gz, splits into 8 chunks, uploads back to S3,
-        │                        launches 8 processor tasks, waits for them
-        ▼
-Fargate processor tasks ×32    ← 4 regions × 8 chunks × 2 vCPU = 64 vCPU
-        │  log_processor.py    — streams chunk line-by-line → Parquet
+Fargate processor task (per file)  ← runs inside AWS, same region as S3
+        │  runner.py → log_processor.py — streams the .gz line-by-line → one Parquet
         ▼
 s3://datacite-logs-processed/datacite-logs/year=YYYY/month=M/region=<region>/
-        │                      ← Hive-partitioned Parquet, Snappy compressed
+        │                      ← Hive-partitioned Parquet, Snappy compressed,
+        │                        one whole-file parquet per region
         ▼
-AWS Athena  datacite.resolution_logs
+AWS Athena  datacite.resolution_logs   (MSCK REPAIR TABLE to register partitions)
 ```
+
+The copy is the only manual step; processing is **auto-triggered** by the S3
+object-created event. See [RUNBOOK.md](RUNBOOK.md) for the monthly procedure and
+the (rare) manual-reprocess path.
 
 ---
 
@@ -32,12 +33,11 @@ AWS Athena  datacite.resolution_logs
 
 | File | Purpose |
 |---|---|
-| `copy_logs.py` | Cross-account S3 copy. Reads from source account, writes to `datacite-logs`. 25 MB chunks with exponential backoff retry. |
-| `chunk_and_process.py` | Local launcher. Launches one splitter Fargate task per region and waits for them to complete. No data passes through the local machine. |
-| `lambda/splitter.py` | Fargate splitter task. Streams a `.gz` from S3, round-robin splits into N gzip chunks, uploads them, launches N processor tasks, and waits. Runs inside AWS. |
-| `lambda/log_processor.py` | Core processing logic. Streams gzip line-by-line, writes a single valid Parquet file to S3 via `_S3StreamingBuffer`. |
+| `copy_logs.py` | Cross-account S3 copy. Reads from source account, writes to `datacite-logs`. 25 MB chunks with exponential backoff retry; idempotent (skips files already present). |
+| `lambda/log_processor.py` | Core processing logic. Streams gzip line-by-line, writes a single valid Parquet file to S3 via `_S3StreamingBuffer`. Invoked per file by the S3-event auto-trigger. |
 | `lambda/runner.py` | Processor Fargate entry point. Reads `INPUT_BUCKET`, `INPUT_KEY`, `OUTPUT_KEY`, `OUTPUT_BUCKET` from env vars and calls `process()`. |
-| `lambda/Dockerfile` | `python:3.12-slim` image with pyarrow and boto3. Shared by both splitter and processor tasks. Build for `linux/amd64`, push to ECR. |
+| `lambda/Dockerfile` | `python:3.12-slim` image with pyarrow and boto3. Build for `linux/amd64`, push to ECR. |
+| `scripts/copy_status.py` | Reports copy progress % (from the copy log + dest bucket). |
 | `lambda/requirements.txt` | Python dependencies: `pyarrow`, `boto3`. |
 
 ---
@@ -52,10 +52,7 @@ AWS Athena  datacite.resolution_logs
 | Comparison bucket | `datacite-logs-processed-compare` (us-east-2) |
 | ECS Cluster | `datacite-logs` |
 | Processor task definition | `datacite-log-processor` (current: `:4`) |
-| Splitter task definition | `datacite-log-splitter` (current: `:1`) |
 | Container name (processor) | `log-processor` |
-| Container name (splitter) | `log-splitter` |
-| Fargate vCPU quota | 64 vCPU on-demand (us-east-2) |
 | Athena database | `datacite` |
 | Athena table | `resolution_logs` |
 | Athena comparison table | `resolution_logs_compare` |
@@ -141,50 +138,34 @@ These are Handle System protocol codes, not HTTP status codes:
 python copy_logs.py
 ```
 
-### 2. Launch splitter tasks
+### 2. Wait for auto-processing
+
+Nothing to launch: the object-created event on `s3://datacite-logs/YYYYMM/`
+auto-triggers one processor Fargate task per file, each streaming its `.gz` →
+one whole-file Parquet in `datacite-logs-processed/…/region=<region>/`. Confirm
+all four region parquets appear before continuing. (If a region's parquet never
+shows up, its trigger failed — see [RUNBOOK.md](RUNBOOK.md) → Manual reprocess.)
+
+**Deploy/update the processor image** (first time, and after any change to
+`log_processor.py` / `runner.py`):
 
 ```bash
-python chunk_and_process.py
-# single file:
-python chunk_and_process.py --key 202605/DataCite-access.log-202605-us-east-1.gz
-```
-
-This launches 4 splitter Fargate tasks (one per region) and waits for them. No data passes through the local machine.
-
-Each splitter task runs inside AWS and:
-- Streams the `.gz` directly from S3 (same-region, fast)
-- Round-robin splits lines into 8 gzip chunks, uploading back to S3 via multipart
-- Launches 8 processor tasks in parallel
-- Waits for all 8 to complete before exiting
-
-All 32 processor tasks (4 regions × 8 chunks × 2 vCPU = 64 vCPU) run simultaneously. The largest file (~1.8 GB compressed, 385M rows) completes in ~6 min end-to-end. The splitter task itself requires ~2 vCPU and runs for the duration of splitting + processing.
-
-**Deploy the splitter image** (first time, and after any changes to `splitter.py`):
-
-```bash
-# Build and push — same image as the processor, both entry points included
 docker build --platform linux/amd64 -t datacite-log-processor lambda/
 docker tag datacite-log-processor:latest <ECR_URI>:latest
 docker push <ECR_URI>:latest
-
-# Register the splitter task definition (CMD override to run splitter.py)
-# In the ECS console or via CLI, create datacite-log-splitter with:
-#   image: <ECR_URI>:latest
-#   command: ["python", "splitter.py"]
-#   container name: log-splitter
-#   IAM role must allow: s3:GetObject, s3:PutObject, s3:CreateMultipartUpload,
-#                        s3:UploadPart, s3:CompleteMultipartUpload,
-#                        s3:AbortMultipartUpload, ecs:RunTask, iam:PassRole
+# The datacite-log-processor task definition's IAM role must allow:
+#   s3:GetObject, s3:PutObject, s3:CreateMultipartUpload, s3:UploadPart,
+#   s3:CompleteMultipartUpload, s3:AbortMultipartUpload
 ```
 
 ### 3. Register new Athena partitions
 
 ```sql
-ALTER TABLE datacite.resolution_logs ADD PARTITION
-  (year=2026, month=5, region='us-east-1')
-  LOCATION 's3://datacite-logs-processed/datacite-logs/year=2026/month=5/region=us-east-1/';
--- repeat for each region
+MSCK REPAIR TABLE datacite.resolution_logs;
 ```
+
+This scans the S3 layout and registers any new `year=/month=/region=` partitions.
+(You can still `ALTER TABLE … ADD PARTITION` a single partition by hand if needed.)
 
 **Partition format notes:**
 - Use `month=5` not `month=05` — Athena's INT partition type does not match leading-zero strings
@@ -194,11 +175,11 @@ ALTER TABLE datacite.resolution_logs ADD PARTITION
 
 ## Comparison Runs
 
-To validate a pipeline change without overwriting production data, direct output to the comparison bucket:
-
-```bash
-python chunk_and_process.py --output-bucket datacite-logs-processed-compare
-```
+To validate a pipeline change without overwriting production data, run a processor
+task by hand with `OUTPUT_BUCKET` pointed at the comparison bucket (one `aws ecs
+run-task` per file — see [RUNBOOK.md](RUNBOOK.md) → Manual reprocess, adding
+`{"name":"OUTPUT_BUCKET","value":"datacite-logs-processed-compare"}` to the
+container environment).
 
 Create the comparison Athena table once:
 
@@ -245,7 +226,9 @@ Filename pattern: `DataCite-access.log-YYYYMM-<region>.gz`. Split on `-`, join f
 
 ### Chunk output keys
 
-`chunk_and_process.py` constructs the `OUTPUT_KEY` before launching each Fargate task and passes it as an environment variable. This ensures all chunks for a region land in the same Hive partition directory with distinct filenames.
+The processor derives its `OUTPUT_KEY` from the input key's region and month, so
+each region's Parquet lands in the correct `year=/month=/region=` Hive partition.
+`OUTPUT_KEY` / `OUTPUT_BUCKET` env vars can override this (e.g. for comparison runs).
 
 ---
 

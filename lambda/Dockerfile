@@ -5,6 +5,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY log_processor.py runner.py splitter.py ./
+COPY log_processor.py runner.py ./
 
 CMD ["python", "runner.py"]

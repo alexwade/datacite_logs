@@ -13,8 +13,7 @@ per month across 4 AWS regions into a Hive-partitioned data warehouse
 > **The one thing to remember:** copying a month's files into
 > `s3://datacite-logs/YYYYMM/` **auto-triggers** processing (S3 event → Fargate).
 > Each `.gz` becomes one Parquet on its own — so the monthly job is just
-> **copy → wait → `MSCK REPAIR TABLE`**. Do **not** run `chunk_and_process.py`
-> for a normal month (it duplicates/pollutes partitions — see the RUNBOOK).
+> **copy → wait → `MSCK REPAIR TABLE`**.
 
 ## Quick start
 
@@ -39,16 +38,13 @@ Full details, verification queries, and gotchas are in **[RUNBOOK.md](RUNBOOK.md
 ├── RUNBOOK.md                 # Monthly operational guide — READ FIRST
 ├── DESIGN.md                  # Architecture, schema, rationale
 ├── copy_logs.py               # Cross-account S3 copy (source → staging); idempotent, retrying
-├── chunk_and_process.py       # MANUAL reprocess only (Fargate split→process); not the normal path
 ├── lambda/                    # The auto-triggered processor
 │   ├── log_processor.py       #   gzip → Parquet via streaming S3 writer
-│   ├── splitter.py            #   splits a large .gz and launches processor tasks
 │   ├── runner.py              #   Fargate container entry point
 │   ├── Dockerfile             #   python:3.12-slim image (push to ECR)
 │   └── requirements.txt
 ├── scripts/
-│   ├── copy_status.py         #   report copy progress %
-│   └── cleanup_chunk_pollution.py  # remove duplicate chunk parquets (recovery; guarded)
+│   └── copy_status.py         #   report copy progress %
 ├── analysis/
 │   ├── monthly_queries.ipynb  #   standard per-month queries (regions, outcomes, referrers, UAs)
 │   └── ai_bot_traffic_analysis.ipynb  # AI-bot traffic study (referrer + user-agent signals)
